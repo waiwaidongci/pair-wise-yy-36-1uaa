@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CONFIRM_ROLES, CREATE_ROLES, ENTITY,
+                    RECORD_ROLES, REVIEW_STATE, TERMINAL_STATES, TITLE,
+                    VIEW_ROLES, completion_blockers, confirmation_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -63,17 +66,54 @@ class Service:
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
+        closing = target in TERMINAL_STATES
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        if closing:
+            blockers += self._confirmation_blockers(item_id)
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
-        updated = self.repository.transition_item(item_id, target, expected_version, actor)
-        self.repository.append_audit("transition", ENTITY, item_id, actor, {
+        guard = self._confirmation_guard(item_id) if closing else None
+        updated = self.repository.transition_item(item_id, target, expected_version,
+                                                  actor, guard=guard)
+        detail = {
             "from": item["status"], "to": target,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
-        })
+        }
+        if closing:
+            confirmation = self.repository.latest_confirmation(item_id)
+            detail["confirmation_batch"] = confirmation["id"] if confirmation else None
+        self.repository.append_audit("transition", ENTITY, item_id, actor, detail)
         return self.enrich(updated)
+
+    def confirm_review(self, item_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, CONFIRM_ROLES)
+        actor = require_text(actor, "actor", 100)
+        item = self.repository.get_item(item_id)
+        if item["status"] != REVIEW_STATE:
+            raise ConflictError("仅复查中的事件可以进行复查确认")
+        confirmation, created = self.repository.create_confirmation(item_id, actor)
+        if created:
+            self.repository.append_audit("confirm_review", ENTITY, item_id, actor, {
+                "batch": confirmation["id"],
+                "item_version": confirmation["item_version"],
+                "record_count": confirmation["record_count"],
+                "record_fingerprint": confirmation["record_fingerprint"],
+            })
+        return {"confirmation": confirmation, "created": created}
+
+    def _confirmation_blockers(self, item_id: int) -> list:
+        item = self.repository.get_item(item_id)
+        record_ids = [record["id"] for record in self.repository.list_records(item_id)]
+        confirmation = self.repository.latest_confirmation(item_id)
+        return confirmation_blockers(item, record_ids, confirmation)
+
+    def _confirmation_guard(self, item_id: int):
+        def guard() -> None:
+            blockers = self._confirmation_blockers(item_id)
+            if blockers:
+                raise ConflictError("；".join(blockers))
+        return guard
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
@@ -91,8 +131,7 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
         result["priority"] = priority_score(
             item["severity"], item["quantity"], item["threshold"])
@@ -100,4 +139,17 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        open_records = self.repository.open_record_count(item["id"])
+        record_ids = [r["id"] for r in self.repository.list_records(item["id"])]
+        confirmation = self.repository.latest_confirmation(item["id"])
+        result["open_records"] = open_records
+        result["latest_confirmation_batch"] = confirmation["id"] if confirmation else None
+        blockers: list = []
+        if item["status"] == REVIEW_STATE:
+            blockers = completion_blockers("closed", open_records)
+            blockers += confirmation_blockers(item, record_ids, confirmation)
+        elif item["status"] not in TERMINAL_STATES:
+            blockers = ["事件尚未进入复查，不能关闭"]
+        result["close_blockers"] = blockers
+        result["can_close"] = item["status"] == REVIEW_STATE and not blockers
         return result

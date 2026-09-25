@@ -4,11 +4,11 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, STATES, confirmation_fingerprint
 
 
 class Repository:
@@ -65,6 +65,17 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS review_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    item_version INTEGER NOT NULL,
+                    record_fingerprint TEXT NOT NULL,
+                    record_ids TEXT NOT NULL,
+                    record_count INTEGER NOT NULL,
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, item_version, record_fingerprint)
+                );
             """)
 
     @staticmethod
@@ -108,9 +119,11 @@ class Repository:
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str, guard=None) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
+            if guard is not None:
+                guard()
             cur = self.conn.execute(
                 """UPDATE items SET status=?, version=version+1, updated_at=?
                    WHERE id=? AND version=?""",
@@ -156,6 +169,65 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _confirmation(row: sqlite3.Row) -> Dict[str, Any]:
+        result = dict(row)
+        result["record_ids"] = json.loads(result["record_ids"])
+        return result
+
+    def create_confirmation(self, item_id: int, actor: str) -> Tuple[Dict[str, Any], bool]:
+        now = utc_now()
+        with self._lock, self.conn:
+            item_row = self.conn.execute(
+                "SELECT version FROM items WHERE id=?", (item_id,)).fetchone()
+            if item_row is None:
+                raise NotFoundError("项目不存在")
+            version = int(item_row["version"])
+            rows = self.conn.execute(
+                "SELECT id FROM records WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+            record_ids = [int(row["id"]) for row in rows]
+            fingerprint = confirmation_fingerprint(record_ids)
+            key = (item_id, version, fingerprint)
+            row = self.conn.execute(
+                """SELECT * FROM review_confirmations
+                   WHERE item_id=? AND item_version=? AND record_fingerprint=?""",
+                key).fetchone()
+            if row is not None:
+                return self._confirmation(row), False
+            created = True
+            try:
+                self.conn.execute(
+                    """INSERT INTO review_confirmations
+                       (item_id, item_version, record_fingerprint, record_ids,
+                        record_count, actor, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, version, fingerprint, json.dumps(record_ids),
+                     len(record_ids), actor, now))
+            except sqlite3.IntegrityError:
+                created = False
+            row = self.conn.execute(
+                """SELECT * FROM review_confirmations
+                   WHERE item_id=? AND item_version=? AND record_fingerprint=?""",
+                key).fetchone()
+        return self._confirmation(row), created
+
+    def latest_confirmation(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM review_confirmations
+                   WHERE item_id=? ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return self._confirmation(row) if row is not None else None
+
+    def list_confirmations(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM review_confirmations WHERE item_id=? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        return [self._confirmation(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

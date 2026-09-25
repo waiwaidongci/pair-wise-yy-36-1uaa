@@ -119,6 +119,10 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/confirm-review"):
+                    item_id = int(path.split("/")[3])
+                    result = service.confirm_review(item_id, actor, role)
+                    self._json(201 if result["created"] else 200, result)
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
