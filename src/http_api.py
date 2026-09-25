@@ -113,6 +113,10 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/review-confirmations"):
+                    item_id = int(path.split("/")[3])
+                    confirmation = service.confirm_review(item_id, actor, role)
+                    self._json(201 if confirmation.get("created") else 200, confirmation)
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

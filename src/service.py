@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    REVIEW_CONFIRM_ROLES, TITLE, VIEW_ROLES, completion_blockers,
+                    escalation_required, is_review_state, priority_score,
+                    response_deadline_hours, review_blockers, role_for_transition,
+                    same_confirmation_snapshot, validate_transition)
 
 
 class Service:
@@ -63,11 +65,18 @@ class Service:
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
-        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
-        if blockers:
-            from .domain import ConflictError
-            raise ConflictError("；".join(blockers))
-        updated = self.repository.transition_item(item_id, target, expected_version, actor)
+        if target == "closed":
+            # 预校验给出可读的409原因；repository.close_item在事务内做权威判定，
+            # 防止补材料与关闭并发时漏掉新材料。
+            blockers = self._close_blockers(item)
+            if blockers:
+                raise ConflictError("；".join(blockers))
+            updated = self.repository.close_item(item_id, expected_version, actor)
+        else:
+            blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+            if blockers:
+                raise ConflictError("；".join(blockers))
+            updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
             "from": item["status"], "to": target,
             "escalation_required": escalation_required(
@@ -75,9 +84,67 @@ class Service:
         })
         return self.enrich(updated)
 
+    def confirm_review(self, item_id: int, actor: str, role: str) -> Dict[str, Any]:
+        """合规员在复查阶段按当前全部材料编号与事件版本做确认。
+        同一批材料重复确认不新增批次；材料或版本变化后确认生成新批次。"""
+        ensure_role(role, REVIEW_CONFIRM_ROLES)
+        actor = require_text(actor, "actor", 100)
+        item = self.repository.get_item(item_id)
+        if not is_review_state(item["status"]):
+            raise ConflictError("仅复查阶段可以做复查确认")
+        record_ids = self.repository.all_record_ids(item_id)
+        version = item["version"]
+        latest = self.repository.latest_review_confirmation(item_id)
+        if latest is not None and same_confirmation_snapshot(
+                record_ids, version, latest["record_ids"], latest["item_version"]):
+            return {"created": False, "batch_no": latest["batch_no"],
+                    "item_version": version, "record_ids": record_ids,
+                    "created_by": latest["created_by"], "created_at": latest["created_at"]}
+        confirmation = self.repository.save_review_confirmation(
+            item_id, version, record_ids, actor)
+        self.repository.append_audit("review_confirm", ENTITY, item_id, actor, {
+            "batch_no": confirmation["batch_no"], "item_version": version,
+            "record_count": len(record_ids),
+        })
+        return {"created": True, "batch_no": confirmation["batch_no"],
+                "item_version": version, "record_ids": record_ids,
+                "created_by": actor, "created_at": confirmation["created_at"]}
+
+    def _close_blockers(self, item: Dict[str, Any]) -> list:
+        record_rows = self.repository.list_records(item["id"])
+        open_records = sum(1 for r in record_rows if r["status"] == "open")
+        latest = self.repository.latest_review_confirmation(item["id"])
+        return review_blockers(
+            item["status"], open_records, [r["id"] for r in record_rows],
+            item["version"],
+            latest["record_ids"] if latest else None,
+            latest["item_version"] if latest else None)
+
+    def _review_info(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        record_rows = self.repository.list_records(item["id"])
+        latest = self.repository.latest_review_confirmation(item["id"])
+        blockers = review_blockers(
+            item["status"],
+            sum(1 for r in record_rows if r["status"] == "open"),
+            [r["id"] for r in record_rows], item["version"],
+            latest["record_ids"] if latest else None,
+            latest["item_version"] if latest else None)
+        return {
+            "can_close": not blockers,
+            "close_blockers": blockers,
+            "latest_batch_no": latest["batch_no"] if latest else None,
+            "confirmed_item_version": latest["item_version"] if latest else None,
+            "confirmed_record_count": len(latest["record_ids"]) if latest else 0,
+            "confirmed_by": latest["created_by"] if latest else None,
+            "confirmed_at": latest["created_at"] if latest else None,
+        }
+
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
-        return self.enrich(self.repository.get_item(item_id))
+        item = self.repository.get_item(item_id)
+        result = self.enrich(item)
+        result["review"] = self._review_info(item)
+        return result
 
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)

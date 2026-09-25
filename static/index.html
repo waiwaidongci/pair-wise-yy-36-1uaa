@@ -1,1 +1,120 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业排污许可与超标处置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>企业排污许可与超标处置</h1><p>汇总监测和工况，判断排放超标并跟踪复测、整改、执法与复查</p><p>按浓度与许可限值计算超标倍数，异常读数先进入评估；关闭前必须没有未完成整改项。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>企业排污许可与超标处置</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem;color:#17212b}
+h1{font-size:1.4rem}.muted{color:#5b6b7b;font-size:.9rem}
+.bar{display:flex;gap:.5rem;align-items:center;margin:1rem 0;flex-wrap:wrap}
+button{padding:.45rem .9rem;border:1px solid #2b6cb0;background:#2b6cb0;color:#fff;border-radius:4px;cursor:pointer}
+button.secondary{background:#fff;color:#2b6cb0}
+button:disabled{opacity:.45;cursor:not-allowed}
+select,input{padding:.4rem;border:1px solid #c2ccd6;border-radius:4px}
+.item{border:1px solid #d8e0e8;border-radius:6px;padding:.8rem 1rem;margin:.6rem 0;cursor:pointer}
+.item:hover{background:#f4f7f9}.item.active{border-color:#2b6cb0;background:#eef5fc}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:10px;background:#e4ebf2;font-size:.8rem;margin-left:.4rem}
+#detail{border:1px solid #d8e0e8;border-radius:6px;padding:1rem;margin-top:1rem;display:none}
+.ok{color:#20805a}.bad{color:#c0392b}
+pre{background:#f4f7f9;padding:1rem;overflow:auto;border-radius:6px;font-size:.82rem}
+.actions{margin:.8rem 0;display:flex;gap:.5rem;flex-wrap:wrap}
+.blocker{background:#fdecea;border:1px solid #f5c6c0;color:#94302a;padding:.6rem .8rem;border-radius:6px;margin:.5rem 0}
+.notice{background:#e8f5ee;border:1px solid #b7e2cb;color:#206048;padding:.6rem .8rem;border-radius:6px;margin:.5rem 0}
+</style>
+</head>
+<body>
+<h1>企业排污许可与超标处置</h1>
+<p class="muted">汇总监测和工况，判断排放超标并跟踪复测、整改、执法与复查。复查阶段须由合规员按当前材料编号与事件版本确认；确认后再新增材料，旧确认立即失效，关闭返回 409 并要求重新确认。</p>
+<div class="bar">
+  <label>操作人 <input id="actor" value="demo" size="8"></label>
+  <button onclick="loadItems()">刷新列表</button>
+  <button class="secondary" onclick="createItem()">新建示例事件</button>
+</div>
+<div id="items"></div>
+<div id="detail"></div>
+<pre id="raw" class="muted">接口原始响应将显示在这里。</pre>
+<script>
+const NEXT={'reported':'assessing','assessing':'remediation','remediation':'inspection','inspection':'closed'};
+const NEXT_ROLE={'assessing':'compliance_officer','remediation':'operator','inspection':'compliance_officer','closed':'director'};
+async function api(path,opts={}){
+  opts.headers=Object.assign({'X-Actor':document.getElementById('actor').value,'Content-Type':'application/json'},opts.headers||{});
+  const r=await fetch(path,opts);
+  const data=await r.json().catch(()=>({}));
+  document.getElementById('raw').textContent=`${(opts.method||'GET')} ${path} -> ${r.status}\n`+JSON.stringify(data,null,2);
+  if(!r.ok) throw Object.assign(new Error(data.message||('HTTP '+r.status)),{status:r.status,data});
+  return data;
+}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function loadItems(){
+  const {items}=await api('/api/items',{headers:{'X-Role':'viewer'}});
+  document.getElementById('items').innerHTML=items.map(it=>
+    `<div class="item" onclick="showItem(${it.id})"><b>#${it.id} ${esc(it.title)}</b><span class="tag">${it.status}</span><span class="tag">v${it.version}</span><div class="muted">${esc(it.severity)} · 优先级 ${it.priority}</div></div>`
+  ).join('')||'<p class="muted">暂无事件。</p>';
+}
+async function createItem(){
+  await api('/api/items',{method:'POST',headers:{'X-Role':'operator'},body:JSON.stringify({
+    title:'复查演示事件 '+new Date().toLocaleTimeString(),
+    description:'演示复查确认、补材料失效与关闭阻塞',severity:'exceedance',quantity:12,threshold:6})});
+  await loadItems();
+}
+let current=null;
+async function showItem(id){
+  current=await api('/api/items/'+id,{headers:{'X-Role':'viewer'}});
+  const {records}=await api(`/api/items/${id}/records`,{headers:{'X-Role':'viewer'}});
+  const rv=current.review||{};
+  const next=NEXT[current.status];
+  const closeBtn=current.status==='inspection'
+    ? `<button onclick="doClose()">关闭（director）</button>`:'';
+  const advanceBtn=next&&current.status!=='inspection'
+    ? `<button onclick="doAdvance()">推进到 ${next}（${NEXT_ROLE[next]}）</button>`:'';
+  const confirmBtn=current.status==='inspection'
+    ? `<button onclick="doConfirm()">复查确认（compliance_officer）</button>`:'';
+  let reviewPanel='';
+  if(current.status==='inspection'){
+    reviewPanel=rv.can_close
+      ? `<div class="notice">可以关闭：最近确认批次 <b>RC-${rv.latest_batch_no}</b>，覆盖 ${rv.confirmed_record_count} 份材料、事件 v${rv.confirmed_item_version}。</div>`
+      : `<div class="blocker"><b>关闭被阻塞（关闭将返回 409）：</b><ul>${rv.close_blockers.map(b=>`<li>${esc(b)}</li>`).join('')}</ul>${rv.latest_batch_no?`最近确认批次：RC-${rv.latest_batch_no}（已失效）`:''}</div>`;
+  }
+  document.getElementById('detail').style.display='block';
+  document.getElementById('detail').innerHTML=`
+    <h2>#${current.id} ${esc(current.title)} <span class="tag">${current.status}</span><span class="tag">v${current.version}</span></h2>
+    <p class="muted">${esc(current.description)}</p>
+    <div class="actions">
+      ${advanceBtn}${confirmBtn}${closeBtn}
+      <button class="secondary" onclick="addRecord('closed')">补材料（已关闭事项）</button>
+      <button class="secondary" onclick="addRecord('open')">补材料（未关闭事项）</button>
+      <button class="secondary" onclick="showItem(${id})">刷新详情</button>
+    </div>
+    ${reviewPanel}
+    <h3>材料（${records.length}）</h3>
+    <pre>${esc(JSON.stringify(records.map(r=>({id:r.id,kind:r.kind,status:r.status})),null,2))}</pre>`;
+}
+async function doAdvance(){
+  const target=NEXT[current.status];
+  await api(`/api/items/${current.id}/transition`,{method:'POST',headers:{'X-Role':NEXT_ROLE[target]},
+    body:JSON.stringify({target,expected_version:current.version})});
+  await loadItems();await showItem(current.id);
+}
+async function doConfirm(){
+  await api(`/api/items/${current.id}/review-confirmations`,{method:'POST',headers:{'X-Role':'compliance_officer'}});
+  await showItem(current.id);
+}
+async function doClose(){
+  try{
+    await api(`/api/items/${current.id}/transition`,{method:'POST',headers:{'X-Role':'director'},
+      body:JSON.stringify({target:'closed',expected_version:current.version})});
+  }catch(e){
+    if(e.status===409){alert('关闭被拒绝（409）：'+e.message+'\n\n请重新完成复查确认。')}
+  }
+  await loadItems();await showItem(current.id);
+}
+async function addRecord(status){
+  await api(`/api/items/${current.id}/records`,{method:'POST',headers:{'X-Role':'operator'},
+    body:JSON.stringify({kind:'supplement',detail:'现场补充材料 @ '+new Date().toLocaleTimeString(),status,external_ref:'MAT-'+Date.now()})});
+  await showItem(current.id);
+}
+loadItems();
+</script>
+</body>
+</html>

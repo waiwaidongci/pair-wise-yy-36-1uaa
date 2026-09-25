@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, REVIEW_STATE, STATES, review_blockers
 
 
 class Repository:
@@ -53,6 +53,16 @@ class Repository:
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS review_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    batch_no INTEGER NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    record_ids TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, batch_no)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,9 +136,13 @@ class Repository:
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
-        self.get_item(item_id)
         try:
             with self._lock, self.conn:
+                row = self.conn.execute("SELECT status FROM items WHERE id=?", (item_id,)).fetchone()
+                if row is None:
+                    raise NotFoundError("项目不存在")
+                if row["status"] == "closed":
+                    raise ConflictError("事件已关闭，不能再补充材料")
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
                        created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
@@ -156,6 +170,84 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def all_record_ids(self, item_id: int) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM records WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def latest_review_confirmation(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT id, batch_no, item_version, record_ids, created_by, created_at
+                   FROM review_confirmations WHERE item_id=? ORDER BY batch_no DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["record_ids"] = json.loads(result["record_ids"])
+        return result
+
+    def save_review_confirmation(self, item_id: int, item_version: int,
+                                 record_ids: List[int], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        ids_json = json.dumps(list(record_ids), separators=(",", ":"))
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(batch_no),0) AS n FROM review_confirmations WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            batch_no = int(row["n"]) + 1
+            cur = self.conn.execute(
+                """INSERT INTO review_confirmations(item_id, batch_no, item_version,
+                   record_ids, created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, batch_no, item_version, ids_json, actor, now),
+            )
+            confirmation_id = int(cur.lastrowid)
+        return {"id": confirmation_id, "item_id": item_id, "batch_no": batch_no,
+                "item_version": item_version, "record_ids": list(record_ids),
+                "created_by": actor, "created_at": now}
+
+    def close_item(self, item_id: int, expected_version: int,
+                   actor: str) -> Dict[str, Any]:
+        """原子关闭：在同一事务/锁内读取复查状态、材料与最近确认后再更新，
+        确保与补材料并发时不会漏掉新增材料。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            item = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item is None:
+                raise NotFoundError("项目不存在")
+            if item["status"] == "closed":
+                raise ConflictError("事件已关闭")
+            if item["status"] != REVIEW_STATE:
+                raise ConflictError(f"不能从{item['status']}转换到closed")
+            if int(item["version"]) != expected_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            record_rows = self.conn.execute(
+                "SELECT id, status FROM records WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+            open_records = sum(1 for r in record_rows if r["status"] == "open")
+            confirmed = self.conn.execute(
+                """SELECT item_version, record_ids FROM review_confirmations
+                   WHERE item_id=? ORDER BY batch_no DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+            confirmed_ids = json.loads(confirmed["record_ids"]) if confirmed else None
+            confirmed_version = int(confirmed["item_version"]) if confirmed else None
+            blockers = review_blockers(
+                item["status"], open_records, [int(r["id"]) for r in record_rows],
+                int(item["version"]), confirmed_ids, confirmed_version)
+            if blockers:
+                raise ConflictError("；".join(blockers))
+            self.conn.execute(
+                """UPDATE items SET status='closed', version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (now, item_id, expected_version),
+            )
+        return self.get_item(item_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
